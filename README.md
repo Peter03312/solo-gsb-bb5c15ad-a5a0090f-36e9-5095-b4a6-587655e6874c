@@ -2,10 +2,11 @@
 
 按**班次**对设备停机时间进行归因的 HTTP 服务：输入设备、班次（带时区、整分钟）与停机事件
 （来源编号 + 连续递增版本 + 起止 + 原因），输出各班次的**保养 / 故障 / 待判**分钟数及所依据
-的事件版本；支持事件幂等上报、版本链校验、迟到更正重算与结算修订查询；已结算班次还可登记
-**现场人工裁定**（唯一单号、整分钟区间、原因/说明，可按单号撤销），裁定按生效顺序覆盖自动
-事件归因、撤销后回退；所有结果变化通过**全局递增游标**的变更流（`GET /changes`）供下游报表
-持续同步每次结算、更正、裁定与撤销。
+的事件版本；支持事件幂等上报、版本链校验、迟到更正重算与结算修订查询；现场网关断网恢复后
+还可**一次性补传同一设备的事件列表**（按列表顺序逐来源核对版本链，整批原子成功或失败）；
+已结算班次还可登记**现场人工裁定**（唯一单号、整分钟区间、原因/说明，可按单号撤销），
+裁定按生效顺序覆盖自动事件归因、撤销后回退；所有结果变化通过**全局递增游标**的变更流
+（`GET /changes`）供下游报表持续同步每次结算、更正、裁定与撤销。
 
 技术栈：Python 3.12 · FastAPI · SQLAlchemy 2 · PostgreSQL 16 · Docker Compose
 
@@ -56,6 +57,17 @@ docker compose exec app pytest            # 算法单测 + API 端到端测试
   - 同来源 + 同版本 + 同内容 → 幂等返回（`200`，`idempotent=true`），不产生新数据；
   - 同版本异内容 → `409 VERSION_CONFLICT`；跳号 → `409 VERSION_GAP`；
   - 新版本即对旧版本的更正，当前生效事件 = 每个来源的最新版本。
+- **断网批量补传**（`POST /events/batch`）：同一设备的非空事件列表，一次请求原子提交。
+  - 各项沿用单条上报的来源、版本、起止、原因字段与校验；按**列表顺序**逐项核对每个来源
+    的版本链（同来源在列表中可出现多次，游标沿列表推进）：已存在的同版本同内容标记
+    `idempotent` 可重试，同版本异内容 `409 VERSION_CONFLICT`、跳号 `409 VERSION_GAP`、
+    未知设备 `404 DEVICE_NOT_FOUND`、任一项字段非法 `422`；
+  - **任一项失败整批回滚**：不留下事件、来源游标推进、修订或变更；
+  - 成功时先应用全部新版本，仅以**批前与批后各来源最新版本区间的并集**确定受影响的已结算
+    班次，再按**最终状态**重算；每班次最多产生一次修订和一条变更，原因分钟数未变则都不产生；
+  - 回执逐项标明 `created` / `idempotent`，并在 `recomputed` 列出实际修订的班次及差额；
+    全部项幂等返回 `200`，否则 `201`；
+  - 并发批次与单条上报共用来源行锁，版本链始终连续；变更游标不会越过未提交结果。
 - **归因**：窗口内每分钟只归因一次，重叠时 **保养 > 故障 > 待判**；结果含各原因分钟数
   与实际贡献分钟的事件版本列表。
 - **现场人工裁定**（仅对已结算班次）：
@@ -89,6 +101,7 @@ docker compose exec app pytest            # 算法单测 + API 端到端测试
 | `POST` | `/shifts` | 创建班次（重叠 409 / 未知设备 404 / 非法区间 422） |
 | `GET` | `/shifts/{id}` | 班次详情 |
 | `POST` | `/events` | 上报事件版本（新建 201 / 幂等 200 / 冲突·跳号 409） |
+| `POST` | `/events/batch` | 断网批量补传同一设备的事件列表（含新建 201 / 全幂等 200；任一项非法整批 4xx 回滚） |
 | `POST` | `/shifts/{id}/settle` | 结算班次（重复调用幂等返回最新修订） |
 | `GET` | `/shifts/{id}/result?revision=N` | 查询归因结果，缺省最新修订 |
 | `GET` | `/shifts/{id}/revisions` | 全部修订及差额 |
@@ -109,8 +122,8 @@ docker compose exec app pytest            # 算法单测 + API 端到端测试
 | 404 | `RESULT_NOT_FOUND` | 班次尚未结算 |
 | 404 | `REVISION_NOT_FOUND` | 指定修订不存在 |
 | 409 | `SHIFT_OVERLAP` | 同设备班次区间重叠 |
-| 409 | `VERSION_CONFLICT` | 同来源同版本但内容不同 |
-| 409 | `VERSION_GAP` | 版本跳号（含首版本不为 1） |
+| 409 | `VERSION_CONFLICT` | 同来源同版本但内容不同（单条与批量补传均适用） |
+| 409 | `VERSION_GAP` | 版本跳号（含首版本不为 1；批量补传中任一项跳号则整批失败） |
 | 409 | `SHIFT_NOT_SETTLED` | 班次尚未结算，不能登记现场裁定 |
 | 409 | `RULING_CONFLICT` | 裁定单号已存在但内容不同（含复用已撤销单号） |
 | 404 | `RULING_NOT_FOUND` | 班次下未知裁定单号 |
@@ -229,6 +242,65 @@ curl -X POST http://localhost:8000/events -H 'Content-Type: application/json' \
 curl http://localhost:8000/shifts/1/result                # 最新修订（revision=2）
 curl 'http://localhost:8000/shifts/1/result?revision=1'   # 指定修订：结算时的原结果（failure=60）
 curl http://localhost:8000/shifts/1/revisions             # 全部修订及每次差额
+```
+
+**8b. 断网恢复：一次性批量补传**（`POST /events/batch`）
+
+网关断网期间攒下的事件可在恢复后一次补传；请求体给出设备与**非空事件列表**，各项字段与
+单条上报完全一致。列表顺序即各来源版本链的核对顺序。
+
+```bash
+curl -X POST http://localhost:8000/events/batch \
+  -H 'Content-Type: application/json' \
+  -d '{"device_id":"CNC-01","events":[
+    {"source_id":"MES-1","version":1,
+     "start":"2026-10-01T10:00:00+08:00","end":"2026-10-01T11:00:00+08:00","reason":"maintenance"},
+    {"source_id":"PLC-9","version":1,
+     "start":"2026-10-01T10:30:00+08:00","end":"2026-10-01T12:00:00+08:00","reason":"failure"},
+    {"source_id":"PLC-9","version":2,
+     "start":"2026-10-01T10:30:00+08:00","end":"2026-10-01T11:30:00+08:00","reason":"failure"}
+  ]}'
+```
+
+```json
+{
+  "device_id": "CNC-01",
+  "status": "applied",
+  "items": [
+    {"index": 0, "source_id": "MES-1", "version": 1, "status": "created",    "idempotent": false},
+    {"index": 1, "source_id": "PLC-9", "version": 1, "status": "created",    "idempotent": false},
+    {"index": 2, "source_id": "PLC-9", "version": 2, "status": "created",    "idempotent": false}
+  ],
+  "recomputed": [{
+    "shift_id": 1, "revision": 2,
+    "totals": {"maintenance": 60, "failure": 30, "pending": 0},
+    "delta":  {"maintenance": 0,  "failure": -30, "pending": 0}
+  }]
+}
+```
+
+要点：
+
+- 逐项结果 `items[].status`：`created`（新建）或 `idempotent`（已存在的同版本同内容重试，
+  包括列表内重复项）；全部幂等时 HTTP `200`，含任一新建设时 `201`；
+- 全部新版本先落库，再按**最终状态**重算一次 —— 上例中 `PLC-9` 虽在批内经历 v1→v2，
+  班次 1 也**只产生一次修订**（revision=2），不会出现按 v1 中间态产生的空转修订；
+- 受影响班次以"批前 ∪ 批后各来源最新版本区间"判定：新版本区间不再覆盖、但旧版本覆盖过的
+  已结算班次同样会被重算；
+- 任一项非法（未知设备 `404 DEVICE_NOT_FOUND`、版本冲突 `409 VERSION_CONFLICT`、
+  跳号 `409 VERSION_GAP`、字段非法 `422 VALIDATION_ERROR`）→ **整批失败**，
+  不写入任何事件、修订或变更。
+
+```bash
+# 整批失败示例：第二项跳号（PLC-9 现有 1、2，批里直接给 4）→ 409 VERSION_GAP，
+# 第一项即便合法也不落库；重试时整批重发即可（已成功的版本会按幂等处理）。
+curl -X POST http://localhost:8000/events/batch -H 'Content-Type: application/json' \
+  -d '{"device_id":"CNC-01","events":[
+    {"source_id":"MES-1","version":2,
+     "start":"2026-10-01T10:00:00+08:00","end":"2026-10-01T11:00:00+08:00","reason":"maintenance"},
+    {"source_id":"PLC-9","version":4,
+     "start":"2026-10-01T10:30:00+08:00","end":"2026-10-01T11:30:00+08:00","reason":"failure"}
+  ]}'
 ```
 
 **9. 现场人工裁定**（仅对已结算班次；接续第 8 步，当前最新为修订 2）
@@ -400,6 +472,11 @@ curl 'http://localhost:8000/changes?cursor=999'    # INVALID_CURSOR（超过当�
   生效顺序；并发不丢失更新。
 - **迟到更正**：新版本落库后，按"旧版本区间 ∪ 新版本区间"找出受影响的已结算班次，用全部
   来源的最新版本与当前生效裁定重算；仅当分钟数变化时追加新修订（避免空修订），差额 = 新 − 旧。
+- **批量补传**：`POST /events/batch` 与单条上报共用 `event_sources` 行锁（按 `source_id`
+  升序依次加锁，避免并发批次相互死锁），故并发批次与单条上报在同一来源上严格串行、版本链
+  连续；批内按列表顺序逐项做与单条一致的幂等/冲突/跳号校验，任一失败即整体回滚。全部新版本
+  flush 后仅重算一次，受影响窗口 = 批前与批后各来源最新版本区间的并集，按最终状态逐班次
+  重算（每班次一把班次行锁、至多一次修订与一条变更），语义与单条迟到更正完全相同。
 - **并发与一致性**：班次不重叠由 PostgreSQL 排他约束（`btree_gist` + `tstzrange '[)'`）兜底；
   结算、更正重算与裁定写入对班次行加锁；事件版本链对来源行加锁，全流程单事务提交。
 - **不可变历史**：`shift_results` 只追加不修改，`(shift_id, revision)` 唯一；裁定撤销只改
@@ -426,6 +503,7 @@ tests/
   test_api.py            # API 端到端测试（需 PostgreSQL）
   test_changes.py        # 变更同步（游标分页/回放/并发）端到端测试（需 PostgreSQL）
   test_adjudications.py  # 现场裁定（提交/幂等/冲突/撤销/联动/并发）端到端测试（需 PostgreSQL）
+  test_events_batch.py   # 断网批量补传（逐项回执/整批回滚/并集窗口/并发连续链）端到端测试（需 PostgreSQL）
 scripts/smoke.sh         # 冒烟脚本
 Dockerfile / docker-compose.yml / requirements.txt
 ```

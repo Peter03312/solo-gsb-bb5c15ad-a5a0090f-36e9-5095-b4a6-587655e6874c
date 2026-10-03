@@ -72,6 +72,20 @@ echo "-- 越界区间 / 未结算校验：越界 422 RULING_OUT_OF_RANGE，未�
 req POST /shifts/1/adjudications '{"ruling_no":"RX","start":"2026-10-01T07:00:00+08:00","end":"2026-10-01T09:00:00+08:00","reason":"failure","note":"越界"}'
 req POST /shifts/1/adjudications/NOPE/revoke
 
+echo "-- 断网批量补传：MES-1 连续补 v2/v3（最终保养 10:00-11:45，仅 11:30-11:45 落在裁定外）+ 新来源首版本；每班次仅一次修订 --"
+req POST /events/batch '{"device_id":"CNC-01","events":[{"source_id":"MES-1","version":2,"start":"2026-10-01T10:00:00+08:00","end":"2026-10-01T11:30:00+08:00","reason":"maintenance"},{"source_id":"MES-1","version":3,"start":"2026-10-01T10:00:00+08:00","end":"2026-10-01T11:45:00+08:00","reason":"maintenance"},{"source_id":"OP-1","version":1,"start":"2026-10-02T09:00:00+08:00","end":"2026-10-02T09:30:00+08:00","reason":"pending"}]}'
+
+echo "-- 同批原样重试：全部 idempotent，HTTP 200，recomputed 为空 --"
+req POST /events/batch '{"device_id":"CNC-01","events":[{"source_id":"MES-1","version":2,"start":"2026-10-01T10:00:00+08:00","end":"2026-10-01T11:30:00+08:00","reason":"maintenance"},{"source_id":"MES-1","version":3,"start":"2026-10-01T10:00:00+08:00","end":"2026-10-01T11:45:00+08:00","reason":"maintenance"},{"source_id":"OP-1","version":1,"start":"2026-10-02T09:00:00+08:00","end":"2026-10-02T09:30:00+08:00","reason":"pending"}]}'
+
+echo "-- 整批失败：首项合法、次项同版本异内容（MES-1 v3 改起止）→ 409 VERSION_CONFLICT，首项不留痕 --"
+req POST /events/batch '{"device_id":"CNC-01","events":[{"source_id":"OP-1","version":1,"start":"2026-10-02T09:00:00+08:00","end":"2026-10-02T09:30:00+08:00","reason":"pending"},{"source_id":"MES-1","version":3,"start":"2026-10-01T10:00:00+08:00","end":"2026-10-01T10:20:00+08:00","reason":"maintenance"}]}'
+
+echo "-- 跳号 / 未知设备 / 空列表：409 VERSION_GAP / 404 DEVICE_NOT_FOUND / 422 --"
+req POST /events/batch '{"device_id":"CNC-01","events":[{"source_id":"OP-1","version":9,"start":"2026-10-02T09:00:00+08:00","end":"2026-10-02T09:30:00+08:00","reason":"pending"}]}'
+req POST /events/batch '{"device_id":"NOPE","events":[{"source_id":"X","version":1,"start":"2026-10-01T10:00:00+08:00","end":"2026-10-01T11:00:00+08:00","reason":"failure"}]}'
+req POST /events/batch '{"device_id":"CNC-01","events":[]}'
+
 echo "-- 变更同步：从游标 0 回放（每页 1 条），再用 next_cursor 翻页 --"
 req GET "/changes?cursor=0&limit=1"
 req GET "/changes?cursor=1&limit=10"

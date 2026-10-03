@@ -68,6 +68,29 @@ class EventIn(_Interval):
     reason: Reason
 
 
+class EventItemIn(_Interval):
+    """现场网关断网补传批中的单个事件（设备由批量请求体统一给出）。
+
+    字段与校验完全沿用单条上报 POST /events 的 source_id / version /
+    start / end / reason。
+    """
+
+    source_id: str = Field(min_length=1, max_length=64)
+    version: int = Field(ge=1)
+    reason: Reason
+
+
+class EventBatchIn(BaseModel):
+    """现场网关断网后一次性补传的同一设备非空事件列表。
+
+    列表顺序即各来源版本链的核对顺序：任一项未知设备、同版本异内容、跳号
+    或参数非法，整批失败（不写入任何事件、修订、变更）。
+    """
+
+    device_id: str = Field(min_length=1, max_length=64)
+    events: list[EventItemIn] = Field(min_length=1, max_length=1000)
+
+
 class ReasonMinutes(BaseModel):
     maintenance: int
     failure: int
@@ -94,6 +117,26 @@ class EventAccepted(BaseModel):
     source_id: str
     version: int
     idempotent: bool  # True 表示同来源同版本同内容的重复提交，未产生新数据
+    recomputed: list[RecomputedShift] = []
+
+
+class EventItemAck(BaseModel):
+    """补传批中单项的处理结果：逐项标明新建或幂等。"""
+
+    index: int  # 在请求列表中的序号（从 0 开始）
+    source_id: str
+    version: int
+    status: Literal["created", "idempotent"]
+    idempotent: bool
+
+
+class EventBatchAck(BaseModel):
+    """整批补传回执：逐项结果 + 实际产生修订的班次及差额。"""
+
+    device_id: str
+    status: Literal["applied"]
+    items: list[EventItemAck]
+    # 因本批新版本（按最终状态重算）而实际产生新修订的已结算班次
     recomputed: list[RecomputedShift] = []
 
 

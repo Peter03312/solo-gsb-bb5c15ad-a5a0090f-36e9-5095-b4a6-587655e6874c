@@ -22,7 +22,10 @@ from .schemas import (
     DeviceCreate,
     DeviceOut,
     EventAccepted,
+    EventBatchAck,
+    EventBatchIn,
     EventIn,
+    EventItemAck,
     EventVersionRef,
     ReasonMinutes,
     RecomputedShift,
@@ -42,7 +45,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="设备停机归因服务",
-    version="1.2.0",
+    version="1.3.0",
     description=(
         "按班次对设备停机时间进行归因（保养/故障/待判）。"
         "区间均为半开 [start, end)；重叠时保养 > 故障 > 待判，每分钟只归因一次；"
@@ -181,6 +184,60 @@ def ingest_event(
         source_id=ev.source_id,
         version=ev.version,
         idempotent=idempotent,
+        recomputed=[
+            RecomputedShift(
+                shift_id=shift.id,
+                revision=rev.revision,
+                totals=ReasonMinutes(
+                    maintenance=rev.maintenance_minutes,
+                    failure=rev.failure_minutes,
+                    pending=rev.pending_minutes,
+                ),
+                delta=ReasonMinutes(
+                    maintenance=rev.d_maintenance,
+                    failure=rev.d_failure,
+                    pending=rev.d_pending,
+                ),
+            )
+            for shift, rev in recomputed
+        ],
+    )
+
+
+@app.post("/events/batch", response_model=EventBatchAck, tags=["events"])
+def ingest_event_batch(
+    payload: EventBatchIn, response: Response, db: Session = Depends(get_db)
+):
+    """现场网关断网恢复后的一次性补传：同一设备的非空事件列表。
+
+    - 各项沿用单条上报的来源、版本、起止、原因字段与校验；
+      按列表顺序核对每个来源的版本链：
+      已存在的同版本同内容重试幂等（item.status="idempotent"），
+      同版本异内容 409 VERSION_CONFLICT、跳号 409 VERSION_GAP、
+      未知设备 404 DEVICE_NOT_FOUND、任一项字段非法 422；
+    - 任一单项失败 → 整批失败，不留下事件、来源游标推进、修订或变更；
+    - 成功时先应用全部新版本，再以批前与批后各来源最新版本区间的并集
+      确定受影响的已结算班次，按最终状态重算：每个班次最多产生一次修订
+      与一条变更，原因分钟数未变则不产生；
+    - 与单条上报及并发批次共用来源行锁，连续版本链不被破坏。
+    """
+    device_id, events, idempotents, recomputed = services.ingest_event_batch(
+        db, payload
+    )
+    response.status_code = 200 if events and all(idempotents) else 201
+    return EventBatchAck(
+        device_id=device_id,
+        status="applied",
+        items=[
+            EventItemAck(
+                index=i,
+                source_id=ev.source_id,
+                version=ev.version,
+                status="idempotent" if idempotents[i] else "created",
+                idempotent=idempotents[i],
+            )
+            for i, ev in enumerate(events)
+        ],
         recomputed=[
             RecomputedShift(
                 shift_id=shift.id,

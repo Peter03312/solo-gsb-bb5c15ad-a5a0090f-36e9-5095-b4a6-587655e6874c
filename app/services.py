@@ -22,7 +22,13 @@ from .models import (
     Shift,
     ShiftResult,
 )
-from .schemas import AdjudicationIn, DeviceCreate, EventIn, ShiftCreate
+from .schemas import (
+    AdjudicationIn,
+    DeviceCreate,
+    EventBatchIn,
+    EventIn,
+    ShiftCreate,
+)
 
 
 class ApiError(HTTPException):
@@ -351,23 +357,27 @@ def ingest_event(
     src.last_content_hash = digest
     db.flush()
 
-    recomputed = _recompute_affected_shifts(db, payload.device_id, prev, ev)
+    recomputed = _recompute_in_windows(
+        db,
+        payload.device_id,
+        [
+            (ev.start_ts, ev.end_ts),
+            *([(prev.start_ts, prev.end_ts)] if prev is not None else []),
+        ],
+    )
     db.commit()
     return ev, False, recomputed
 
 
-def _recompute_affected_shifts(
+def _recompute_in_windows(
     db: Session,
     device_id: str,
-    prev: EventVersion | None,
-    new: EventVersion,
+    windows: list[tuple[datetime, datetime]],
 ) -> list[tuple[Shift, ShiftResult]]:
-    """迟到更正：按事件时间（旧版本与新版本区间的并集）找出受影响的已结算班次，
-    用最新事件版本重算；结果有变化时追加新修订并记录差额。
+    """按给定半开区间的并集找出受影响的已结算班次，用最新事件版本重算；
+    结果有变化时每个班次只追加一次新修订并记录差额。
     """
-    conds = [and_(Shift.start_ts < new.end_ts, Shift.end_ts > new.start_ts)]
-    if prev is not None:
-        conds.append(and_(Shift.start_ts < prev.end_ts, Shift.end_ts > prev.start_ts))
+    conds = [and_(Shift.start_ts < end, Shift.end_ts > start) for start, end in windows]
     shifts = (
         db.execute(
             select(Shift)
@@ -395,6 +405,164 @@ def _recompute_affected_shifts(
         db.flush()
         recomputed.append((shift, rev))
     return recomputed
+
+
+# ---------------------------------------------------------------- 批量补传
+
+
+def ingest_event_batch(
+    db: Session, payload: EventBatchIn
+) -> tuple[str, list[EventVersion], list[bool], list[tuple[Shift, ShiftResult]]]:
+    """现场网关断网后的一次性补传（同一设备的非空事件列表）。
+
+    按列表顺序逐项核对每个来源的版本链，规则与单条上报完全一致：
+    - 已存在的同版本同内容：幂等（status=idempotent，不重写任何数据）；
+    - 同版本异内容 → 409 VERSION_CONFLICT；跳号 → 409 VERSION_GAP；
+    - 未知设备 → 404 DEVICE_NOT_FOUND；字段非法在路由层 422。
+    任何一项失败整批回滚：不留下事件、来源游标推进、修订或变更。
+
+    全部新版本先落库后，以"批前与批后各来源最新版本区间的并集"确定受影响的
+    已结算班次，按最终状态重算；每个班次最多产生一次修订与一条变更，
+    各原因分钟数未变则不产生。
+
+    返回 (设备 id, 全部事件版本（含幂等命中的既有版本，按列表顺序）,
+    逐项是否幂等, 实际产生新修订的 [(班次, 新修订)])。
+    """
+    get_device_or_404(db, payload.device_id)
+    device_id = payload.device_id
+
+    # 确保批中涉及的每个来源的版本链游标存在
+    source_ids = list(dict.fromkeys(item.source_id for item in payload.events))
+    for source_id in source_ids:
+        db.execute(
+            pg_insert(EventSource)
+            .values(device_id=device_id, source_id=source_id, last_version=0)
+            .on_conflict_do_nothing()
+        )
+
+    # 按固定顺序（source_id 升序）逐个加锁所有涉及的来源行；
+    # 与单条上报共用来源行锁，故并发批次 / 单条上报在同一来源上严格串行，
+    # 版本链始终连续；统一加锁顺序避免并发批次相互死锁。
+    sources: dict[tuple[str, str], EventSource] = {}
+    for source_id in sorted(source_ids):
+        sources[(device_id, source_id)] = db.execute(
+            select(EventSource)
+            .where(
+                EventSource.device_id == device_id,
+                EventSource.source_id == source_id,
+            )
+            .with_for_update()
+        ).scalar_one()
+
+    # 批前各来源最新版本（用于确定受影响班次的"旧区间"）
+    pre_state: dict[str, tuple[int, datetime, datetime] | None] = {}
+    for source_id in source_ids:
+        src = sources[(device_id, source_id)]
+        if src.last_version > 0:
+            pre = db.execute(
+                select(EventVersion).where(
+                    EventVersion.device_id == device_id,
+                    EventVersion.source_id == source_id,
+                    EventVersion.version == src.last_version,
+                )
+            ).scalar_one()
+            pre_state[source_id] = (
+                pre.version,
+                pre.start_ts,
+                pre.end_ts,
+            )
+        else:
+            pre_state[source_id] = None
+
+    # 按列表顺序核对并应用全部项；批内同来源多次出现时游标沿列表推进。
+    # 当前版本链游标（来源 -> 当前 last_version / 最新事件行），随批内写入更新
+    cursor: dict[str, int] = {sid: sources[(device_id, sid)].last_version for sid in source_ids}
+    newest: dict[str, EventVersion] = {}
+    for source_id in source_ids:
+        last_ver = cursor[source_id]
+        if last_ver > 0:
+            newest[source_id] = db.execute(
+                select(EventVersion).where(
+                    EventVersion.device_id == device_id,
+                    EventVersion.source_id == source_id,
+                    EventVersion.version == last_ver,
+                )
+            ).scalar_one()
+
+    events: list[EventVersion] = []
+    idempotents: list[bool] = []
+    for item in payload.events:
+        start, end = _utc(item.start), _utc(item.end)
+        digest = _content_hash(start, end, item.reason)
+        src = sources[(device_id, item.source_id)]
+        cur_ver = cursor[item.source_id]
+
+        if item.version <= cur_ver:
+            existing = db.execute(
+                select(EventVersion).where(
+                    EventVersion.device_id == device_id,
+                    EventVersion.source_id == item.source_id,
+                    EventVersion.version == item.version,
+                )
+            ).scalar_one()
+            if existing.content_hash != digest:
+                raise ApiError(
+                    409,
+                    "VERSION_CONFLICT",
+                    f"version {item.version} of source {item.source_id!r} "
+                    "already exists with different content",
+                )
+            events.append(existing)
+            idempotents.append(True)
+            # 幂等项不改变游标；但同来源全部项均为旧版本幂等时，
+            # newest 仍需指向该来源当前最新版本（已在上方预取，这里兜底）。
+            cur_newest = newest.get(item.source_id)
+            if cur_newest is None or existing.version > cur_newest.version:
+                newest[item.source_id] = existing
+            continue
+
+        if item.version > cur_ver + 1:
+            raise ApiError(
+                409,
+                "VERSION_GAP",
+                f"source {item.source_id!r} expects version "
+                f"{cur_ver + 1}, got {item.version}",
+            )
+
+        ev = EventVersion(
+            device_id=device_id,
+            source_id=item.source_id,
+            version=item.version,
+            start_ts=start,
+            end_ts=end,
+            reason=item.reason,
+            content_hash=digest,
+        )
+        db.add(ev)
+        db.flush()
+        src.last_version = item.version
+        src.last_content_hash = digest
+        cursor[item.source_id] = item.version
+        newest[item.source_id] = ev
+        events.append(ev)
+        idempotents.append(False)
+
+    # 批后各来源最新版本区间 ∪ 批前最新版本区间 → 受影响班次的判定窗口
+    windows: list[tuple[datetime, datetime]] = []
+    for source_id in source_ids:
+        before = pre_state[source_id]
+        if before is not None:
+            windows.append((before[1], before[2]))
+        after = newest.get(source_id)
+        if after is not None and (before is None or after.version != before[0]):
+            # 该来源批后最新版本确实被本批推进时才加入新区间
+            windows.append((after.start_ts, after.end_ts))
+
+    # flush 来源游标推进，保证下面重算时数据库中 last_version 已是批后值
+    db.flush()
+    recomputed = _recompute_in_windows(db, device_id, windows)
+    db.commit()
+    return device_id, events, idempotents, recomputed
 
 
 # ---------------------------------------------------------------- 现场人工裁定
