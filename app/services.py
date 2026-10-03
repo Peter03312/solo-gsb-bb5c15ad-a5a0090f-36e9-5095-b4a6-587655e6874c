@@ -22,7 +22,13 @@ from .models import (
     Shift,
     ShiftResult,
 )
-from .schemas import AdjudicationIn, DeviceCreate, EventIn, ShiftCreate
+from .schemas import (
+    AdjudicationIn,
+    DeviceCreate,
+    EventBatchIn,
+    EventIn,
+    ShiftCreate,
+)
 
 
 class ApiError(HTTPException):
@@ -351,27 +357,173 @@ def ingest_event(
     src.last_content_hash = digest
     db.flush()
 
-    recomputed = _recompute_affected_shifts(db, payload.device_id, prev, ev)
+    intervals = [(start, end)]
+    if prev is not None:
+        intervals.append((prev.start_ts, prev.end_ts))
+    recomputed = _recompute_affected_shifts(db, payload.device_id, intervals)
     db.commit()
     return ev, False, recomputed
+
+
+def ingest_event_batch(
+    db: Session, payload: EventBatchIn
+) -> tuple[list[dict], list[tuple[Shift, ShiftResult]]]:
+    """断网补传：同一设备的非空事件列表，整批核对、整批应用（全或无）。
+
+    返回 (逐项回执 [{"source_id", "version", "idempotent"}], 重算的 [(班次, 新修订)])。
+
+    - 按列表顺序核对每个来源的版本链：已存在的同版本同内容项为幂等重试；
+      同版本异内容 / 跳号 / 未知设备 / 任一项非法 → 整批失败，
+      不留下事件、修订或变更（单事务，失败即整体回滚）；
+    - 全部核对通过后一次性应用所有新版本，仅以批前和批后各来源最新版本的
+      区间并集确定受影响的已结算班次，再按最终状态重算；
+      每班次最多产生一次修订和一条变更，分钟数未变则都不产生。
+    """
+    get_device_or_404(db, payload.device_id)
+
+    # 涉及的来源行：不存在则补建；按 source_id 固定顺序加行锁，
+    # 与单条上报及其他并发批次相互串行化，维持连续版本链
+    source_ids = sorted({item.source_id for item in payload.events})
+    for sid in source_ids:
+        db.execute(
+            pg_insert(EventSource)
+            .values(device_id=payload.device_id, source_id=sid, last_version=0)
+            .on_conflict_do_nothing()
+        )
+    sources = (
+        db.execute(
+            select(EventSource)
+            .where(
+                EventSource.device_id == payload.device_id,
+                EventSource.source_id.in_(source_ids),
+            )
+            .order_by(EventSource.source_id)
+            .with_for_update()
+        )
+        .scalars()
+        .all()
+    )
+    src_by_id = {s.source_id: s for s in sources}
+    expected = {s.source_id: s.last_version for s in sources}
+
+    # 按列表顺序逐项核对；全部通过前不写入任何数据
+    pending: dict[tuple[str, int], str] = {}  # 本批已接受新版本的 (来源, 版本) -> 内容哈希
+    new_items: list[tuple] = []  # (item, start_utc, end_utc, digest)
+    acks: list[dict] = []
+    for item in payload.events:
+        start, end = _utc(item.start), _utc(item.end)
+        digest = _content_hash(start, end, item.reason)
+        exp = expected[item.source_id]
+        if item.version <= exp:
+            # 已存在（库中或本批已接受）的同版本：同内容可重试，异内容整批失败
+            existing = pending.get((item.source_id, item.version))
+            if existing is None:
+                existing = db.execute(
+                    select(EventVersion.content_hash).where(
+                        EventVersion.device_id == payload.device_id,
+                        EventVersion.source_id == item.source_id,
+                        EventVersion.version == item.version,
+                    )
+                ).scalar_one()
+            if existing != digest:
+                raise ApiError(
+                    409,
+                    "VERSION_CONFLICT",
+                    f"version {item.version} of source {item.source_id!r} "
+                    "already exists with different content; batch rejected",
+                )
+            acks.append(
+                {
+                    "source_id": item.source_id,
+                    "version": item.version,
+                    "idempotent": True,
+                }
+            )
+        elif item.version == exp + 1:
+            # 连续下一版本：接受为新版本，推进该来源的版本链
+            expected[item.source_id] = item.version
+            pending[(item.source_id, item.version)] = digest
+            new_items.append((item, start, end, digest))
+            acks.append(
+                {
+                    "source_id": item.source_id,
+                    "version": item.version,
+                    "idempotent": False,
+                }
+            )
+        else:
+            raise ApiError(
+                409,
+                "VERSION_GAP",
+                f"source {item.source_id!r} expects version {exp + 1}, "
+                f"got {item.version}; batch rejected",
+            )
+
+    recomputed: list[tuple[Shift, ShiftResult]] = []
+    if new_items:
+        # 应用全部新版本；同一来源取批内最后一个新版本推进版本链游标
+        last_new: dict[str, tuple] = {}
+        for item, start, end, digest in new_items:
+            db.add(
+                EventVersion(
+                    device_id=payload.device_id,
+                    source_id=item.source_id,
+                    version=item.version,
+                    start_ts=start,
+                    end_ts=end,
+                    reason=item.reason,
+                    content_hash=digest,
+                )
+            )
+            last_new[item.source_id] = (item, start, end, digest)
+
+        # 受影响区间 = 各来源（批前最新版本区间 ∪ 批后最新版本区间）的并集
+        intervals: list[tuple[datetime, datetime]] = []
+        for sid, (item, start, end, digest) in last_new.items():
+            src = src_by_id[sid]
+            if src.last_version > 0:
+                prev_start, prev_end = db.execute(
+                    select(EventVersion.start_ts, EventVersion.end_ts).where(
+                        EventVersion.device_id == payload.device_id,
+                        EventVersion.source_id == sid,
+                        EventVersion.version == src.last_version,
+                    )
+                ).one()
+                intervals.append((prev_start, prev_end))
+            intervals.append((start, end))
+            src.last_version = item.version
+            src.last_content_hash = digest
+        db.flush()
+
+        recomputed = _recompute_affected_shifts(db, payload.device_id, intervals)
+
+    db.commit()
+    return acks, recomputed
 
 
 def _recompute_affected_shifts(
     db: Session,
     device_id: str,
-    prev: EventVersion | None,
-    new: EventVersion,
+    intervals: list[tuple[datetime, datetime]],
 ) -> list[tuple[Shift, ShiftResult]]:
-    """迟到更正：按事件时间（旧版本与新版本区间的并集）找出受影响的已结算班次，
-    用最新事件版本重算；结果有变化时追加新修订并记录差额。
+    """迟到更正：按事件时间（相关来源批前/批后版本区间的并集）找出受影响的
+    已结算班次，用全部来源的最新版本与当前生效裁定重算；结果有变化时追加
+    新修订并记录差额。每个班次在此至多重算一次（至多一个新修订）。
     """
-    conds = [and_(Shift.start_ts < new.end_ts, Shift.end_ts > new.start_ts)]
-    if prev is not None:
-        conds.append(and_(Shift.start_ts < prev.end_ts, Shift.end_ts > prev.start_ts))
+    if not intervals:
+        return []
     shifts = (
         db.execute(
             select(Shift)
-            .where(Shift.device_id == device_id, or_(*conds))
+            .where(
+                Shift.device_id == device_id,
+                or_(
+                    *[
+                        and_(Shift.start_ts < end, Shift.end_ts > start)
+                        for start, end in intervals
+                    ]
+                ),
+            )
             .order_by(Shift.id)  # 固定加锁顺序，降低并发更正相互死锁的概率
             .with_for_update()
         )

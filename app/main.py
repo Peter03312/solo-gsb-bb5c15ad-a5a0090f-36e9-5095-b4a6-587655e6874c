@@ -22,6 +22,9 @@ from .schemas import (
     DeviceCreate,
     DeviceOut,
     EventAccepted,
+    EventBatchAccepted,
+    EventBatchIn,
+    EventBatchItemAck,
     EventIn,
     EventVersionRef,
     ReasonMinutes,
@@ -42,11 +45,13 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="设备停机归因服务",
-    version="1.2.0",
+    version="1.3.0",
     description=(
         "按班次对设备停机时间进行归因（保养/故障/待判）。"
         "区间均为半开 [start, end)；重叠时保养 > 故障 > 待判，每分钟只归因一次；"
         "事件按 (来源, 连续版本) 上报，支持幂等与迟到更正重算；"
+        "现场网关断网恢复后可经 POST /events/batch 整批补传同一设备的事件列表"
+        "（全或无：逐项核对版本链，任一非法整批失败）；"
         "已结算班次支持现场人工裁定（提交/按单号撤销），裁定覆盖自动事件归因，"
         "撤销后回退；仅当各原因分钟数变化时追加班次修订并进入全局游标变更流；"
         "GET /changes 提供按全局递增游标分页的结算/更正/裁定变更流，供下游报表同步。"
@@ -163,6 +168,28 @@ def settle_shift(shift_id: int, db: Session = Depends(get_db)):
 # ---------------------------------------------------------------- 事件
 
 
+def _recomputed_out(
+    recomputed: list[tuple[Shift, ShiftResult]],
+) -> list[RecomputedShift]:
+    return [
+        RecomputedShift(
+            shift_id=shift.id,
+            revision=rev.revision,
+            totals=ReasonMinutes(
+                maintenance=rev.maintenance_minutes,
+                failure=rev.failure_minutes,
+                pending=rev.pending_minutes,
+            ),
+            delta=ReasonMinutes(
+                maintenance=rev.d_maintenance,
+                failure=rev.d_failure,
+                pending=rev.d_pending,
+            ),
+        )
+        for shift, rev in recomputed
+    ]
+
+
 @app.post("/events", response_model=EventAccepted, tags=["events"])
 def ingest_event(
     payload: EventIn, response: Response, db: Session = Depends(get_db)
@@ -181,23 +208,32 @@ def ingest_event(
         source_id=ev.source_id,
         version=ev.version,
         idempotent=idempotent,
-        recomputed=[
-            RecomputedShift(
-                shift_id=shift.id,
-                revision=rev.revision,
-                totals=ReasonMinutes(
-                    maintenance=rev.maintenance_minutes,
-                    failure=rev.failure_minutes,
-                    pending=rev.pending_minutes,
-                ),
-                delta=ReasonMinutes(
-                    maintenance=rev.d_maintenance,
-                    failure=rev.d_failure,
-                    pending=rev.d_pending,
-                ),
-            )
-            for shift, rev in recomputed
-        ],
+        recomputed=_recomputed_out(recomputed),
+    )
+
+
+@app.post("/events/batch", response_model=EventBatchAccepted, tags=["events"])
+def ingest_event_batch(
+    payload: EventBatchIn, response: Response, db: Session = Depends(get_db)
+):
+    """现场网关断网恢复后的批量补传：同一设备的非空事件列表，整批核对、整批应用。
+
+    - 逐项沿用单条上报的字段与校验，按列表顺序核对每个来源的版本链：
+      已存在的同版本同内容项为幂等重试（回执 idempotent=true）；
+    - 同版本异内容 409 VERSION_CONFLICT、跳号 409 VERSION_GAP、
+      未知设备 404、任一项非法 422 —— 整批失败，不留下事件、修订或变更；
+    - 成功时先应用全部新版本，仅以批前和批后各来源最新版本的区间并集
+      确定受影响的已结算班次，再按最终状态重算：每班次最多一次修订和
+      一条变更，分钟数未变则都不产生；
+    - 全部项幂等时整体返回 200，否则 201。
+    """
+    acks, recomputed = services.ingest_event_batch(db, payload)
+    items = [EventBatchItemAck(**a) for a in acks]
+    response.status_code = 200 if all(a.idempotent for a in items) else 201
+    return EventBatchAccepted(
+        device_id=payload.device_id,
+        items=items,
+        recomputed=_recomputed_out(recomputed),
     )
 
 

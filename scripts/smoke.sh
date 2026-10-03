@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 冒烟脚本：走完 设备→班次→事件→幂等/冲突→结算→迟到更正→现场裁定/撤销→修订/变更查询 全流程。
+# 冒烟脚本：走完 设备→班次→事件→幂等/冲突→结算→迟到更正→现场裁定/撤销→断网批量补传→修订/变更查询 全流程。
 # 用法：./scripts/smoke.sh [BASE_URL]   （默认 http://localhost:8000）
 set -euo pipefail
 
@@ -67,6 +67,32 @@ req POST /shifts/1/adjudications/R-002/revoke
 
 echo "-- 重复撤销：幂等 200，revision=null --"
 req POST /shifts/1/adjudications/R-002/revoke
+
+echo "-- 断网补传（批量上报）：MES-1 v2 新建 + PLC-9 v2 幂等重试，预期 201，班次只产生一次修订 --"
+req POST /events/batch '{"device_id":"CNC-01","events":[
+  {"source_id":"MES-1","version":2,"start":"2026-10-01T10:00:00+08:00","end":"2026-10-01T12:00:00+08:00","reason":"maintenance"},
+  {"source_id":"PLC-9","version":2,"start":"2026-10-01T10:30:00+08:00","end":"2026-10-01T11:30:00+08:00","reason":"failure"}
+]}'
+
+echo "-- 整批原样重发：全部幂等，预期 200 且 recomputed 为空 --"
+req POST /events/batch '{"device_id":"CNC-01","events":[
+  {"source_id":"MES-1","version":2,"start":"2026-10-01T10:00:00+08:00","end":"2026-10-01T12:00:00+08:00","reason":"maintenance"},
+  {"source_id":"PLC-9","version":2,"start":"2026-10-01T10:30:00+08:00","end":"2026-10-01T11:30:00+08:00","reason":"failure"}
+]}'
+
+echo "-- 批次含同版本异内容项：预期 409 VERSION_CONFLICT，整批失败（PLC-9 v3 不落库）--"
+req POST /events/batch '{"device_id":"CNC-01","events":[
+  {"source_id":"PLC-9","version":3,"start":"2026-10-01T10:30:00+08:00","end":"2026-10-01T12:00:00+08:00","reason":"failure"},
+  {"source_id":"MES-1","version":2,"start":"2026-10-01T09:00:00+08:00","end":"2026-10-01T12:00:00+08:00","reason":"maintenance"}
+]}'
+
+echo "-- 批次跳号：预期 409 VERSION_GAP，整批失败 --"
+req POST /events/batch '{"device_id":"CNC-01","events":[
+  {"source_id":"MES-1","version":4,"start":"2026-10-01T10:00:00+08:00","end":"2026-10-01T12:00:00+08:00","reason":"maintenance"}
+]}'
+
+echo "-- 批次失败后版本链未推进：PLC-9 v3 仍可经单条正常上报 --"
+req POST /events '{"device_id":"CNC-01","source_id":"PLC-9","version":3,"start":"2026-10-01T10:30:00+08:00","end":"2026-10-01T12:00:00+08:00","reason":"failure"}'
 
 echo "-- 越界区间 / 未结算校验：越界 422 RULING_OUT_OF_RANGE，未知单号撤销 404 --"
 req POST /shifts/1/adjudications '{"ruling_no":"RX","start":"2026-10-01T07:00:00+08:00","end":"2026-10-01T09:00:00+08:00","reason":"failure","note":"越界"}'

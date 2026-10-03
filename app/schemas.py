@@ -68,6 +68,21 @@ class EventIn(_Interval):
     reason: Reason
 
 
+class EventBatchItem(_Interval):
+    """断网补传的单个事件版本：字段与校验同单条上报（设备在批次级给出）。"""
+
+    source_id: str = Field(min_length=1, max_length=64)
+    version: int = Field(ge=1)
+    reason: Reason
+
+
+class EventBatchIn(BaseModel):
+    """现场网关断网恢复后的一次性补传：同一设备的非空事件列表。"""
+
+    device_id: str = Field(min_length=1, max_length=64)
+    events: list[EventBatchItem] = Field(min_length=1)
+
+
 class ReasonMinutes(BaseModel):
     maintenance: int
     failure: int
@@ -94,6 +109,22 @@ class EventAccepted(BaseModel):
     source_id: str
     version: int
     idempotent: bool  # True 表示同来源同版本同内容的重复提交，未产生新数据
+    recomputed: list[RecomputedShift] = []
+
+
+class EventBatchItemAck(BaseModel):
+    """批量补传的逐项回执：idempotent=True 表示同版本同内容的已存在项（重试）。"""
+
+    source_id: str
+    version: int
+    idempotent: bool
+
+
+class EventBatchAccepted(BaseModel):
+    """批量补传回执：逐项标明新建/幂等，并列出实际修订的班次及差额。"""
+
+    device_id: str
+    items: list[EventBatchItemAck]
     recomputed: list[RecomputedShift] = []
 
 

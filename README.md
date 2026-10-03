@@ -2,10 +2,11 @@
 
 按**班次**对设备停机时间进行归因的 HTTP 服务：输入设备、班次（带时区、整分钟）与停机事件
 （来源编号 + 连续递增版本 + 起止 + 原因），输出各班次的**保养 / 故障 / 待判**分钟数及所依据
-的事件版本；支持事件幂等上报、版本链校验、迟到更正重算与结算修订查询；已结算班次还可登记
-**现场人工裁定**（唯一单号、整分钟区间、原因/说明，可按单号撤销），裁定按生效顺序覆盖自动
-事件归因、撤销后回退；所有结果变化通过**全局递增游标**的变更流（`GET /changes`）供下游报表
-持续同步每次结算、更正、裁定与撤销。
+的事件版本；支持事件幂等上报、版本链校验、迟到更正重算与结算修订查询；现场网关断网恢复后可
+**整批补传**同一设备的事件列表（全或无：逐项核对版本链，任一非法整批失败，成功时按最终状态
+一次性重算受影响班次）；已结算班次还可登记**现场人工裁定**（唯一单号、整分钟区间、原因/说明，
+可按单号撤销），裁定按生效顺序覆盖自动事件归因、撤销后回退；所有结果变化通过**全局递增游标**
+的变更流（`GET /changes`）供下游报表持续同步每次结算、更正、裁定与撤销。
 
 技术栈：Python 3.12 · FastAPI · SQLAlchemy 2 · PostgreSQL 16 · Docker Compose
 
@@ -56,6 +57,17 @@ docker compose exec app pytest            # 算法单测 + API 端到端测试
   - 同来源 + 同版本 + 同内容 → 幂等返回（`200`，`idempotent=true`），不产生新数据；
   - 同版本异内容 → `409 VERSION_CONFLICT`；跳号 → `409 VERSION_GAP`；
   - 新版本即对旧版本的更正，当前生效事件 = 每个来源的最新版本。
+- **断网补传（批量上报）**：`POST /events/batch` 一次提交同一设备的**非空**事件列表，
+  各项字段与校验同单条上报（来源、版本、起止、原因）。
+  - 按列表顺序核对每个来源的版本链：已存在的同版本同内容项为幂等重试；
+    同版本异内容 / 跳号 / 未知设备 / 任一项非法 → **整批失败**（同事务回滚，
+    不留下事件、修订或变更）；
+  - 成功时先应用全部新版本，**仅以批前和批后各来源最新版本的区间并集**确定受影响
+    的已结算班次，再按最终状态（全部来源最新版本 + 当前生效裁定）重算：
+    每班次最多产生一次修订和一条变更（`trigger=correction`），分钟数未变则都不产生；
+  - 回执逐项标明新建（`idempotent=false`）或幂等（`true`），并列出实际修订的班次
+    及差额；全部项幂等时整体返回 `200`，否则 `201`；
+  - 与单条上报及并发批次共用同一版本链行锁，并发下版本链保持连续无缺口。
 - **归因**：窗口内每分钟只归因一次，重叠时 **保养 > 故障 > 待判**；结果含各原因分钟数
   与实际贡献分钟的事件版本列表。
 - **现场人工裁定**（仅对已结算班次）：
@@ -89,6 +101,7 @@ docker compose exec app pytest            # 算法单测 + API 端到端测试
 | `POST` | `/shifts` | 创建班次（重叠 409 / 未知设备 404 / 非法区间 422） |
 | `GET` | `/shifts/{id}` | 班次详情 |
 | `POST` | `/events` | 上报事件版本（新建 201 / 幂等 200 / 冲突·跳号 409） |
+| `POST` | `/events/batch` | 断网补传：同一设备事件列表整批上报（全或无；逐项回执新建/幂等；全部幂等 200，否则 201） |
 | `POST` | `/shifts/{id}/settle` | 结算班次（重复调用幂等返回最新修订） |
 | `GET` | `/shifts/{id}/result?revision=N` | 查询归因结果，缺省最新修订 |
 | `GET` | `/shifts/{id}/revisions` | 全部修订及差额 |
@@ -314,6 +327,76 @@ curl -X POST http://localhost:8000/events -H 'Content-Type: application/json' \
        "start":"2026-10-01T10:00:00+08:00","end":"2026-10-01T11:00:00+08:00","reason":"failure"}'
 ```
 
+## 断网补传（批量上报）
+
+现场网关断网期间缓存的事件，恢复后通过 `POST /events/batch` 一次补传：同一设备的非空
+事件列表，各项字段与校验同单条上报（`source_id` / `version` / `start` / `end` / `reason`），
+设备在批次级给出。整批核对、整批应用（全或无）。
+
+**1. 补传批次**：新建与幂等混合（假设 `MES-1` 已报到版本 1，班次 1 已结算）
+
+```bash
+curl -X POST http://localhost:8000/events/batch \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "device_id": "CNC-01",
+    "events": [
+      {"source_id":"MES-1","version":2,"start":"2026-10-01T10:00:00+08:00","end":"2026-10-01T11:30:00+08:00","reason":"maintenance"},
+      {"source_id":"PLC-9","version":1,"start":"2026-10-01T11:00:00+08:00","end":"2026-10-01T12:00:00+08:00","reason":"failure"},
+      {"source_id":"MES-1","version":1,"start":"2026-10-01T10:00:00+08:00","end":"2026-10-01T11:00:00+08:00","reason":"maintenance"}
+    ]}'
+# 201
+```
+
+```json
+{
+  "device_id": "CNC-01",
+  "items": [
+    {"source_id": "MES-1", "version": 2, "idempotent": false},
+    {"source_id": "PLC-9", "version": 1, "idempotent": false},
+    {"source_id": "MES-1", "version": 1, "idempotent": true}
+  ],
+  "recomputed": [{
+    "shift_id": 1, "revision": 2,
+    "totals": {"maintenance": 90, "failure": 30, "pending": 0},
+    "delta":  {"maintenance": 30, "failure": 30, "pending": 0}
+  }]
+}
+```
+
+> 按列表顺序核对每个来源的版本链：`MES-1 v2`、`PLC-9 v1` 为连续新版本（新建），
+> 断网期间重复缓存的 `MES-1 v1` 同版本同内容（幂等重试）。全部核对通过后一次性落库，
+> 按最终状态重算受影响班次 —— 上例中保养延长到 11:30（+30），故障 11:30–12:00 计 30 分钟，
+> 班次只产生**一次**修订（revision 2）和一条 `correction` 变更。
+
+**2. 整批原样重发** → 全部项幂等，整体 `200`，`recomputed` 为空，不产生新数据：
+
+```bash
+curl -X POST http://localhost:8000/events/batch -H 'Content-Type: application/json' \
+  -d '<同上请求体>'
+# 200 {"items":[{"idempotent":true,...},...], "recomputed":[]}
+```
+
+**3. 整批失败（全或无）**：任一项非法，整批拒绝，不留下事件、修订或变更
+
+```bash
+# MES-1 v2 已存在但内容不同 → 409 VERSION_CONFLICT，同行的 PLC-9 v2 也不会落库
+curl -X POST http://localhost:8000/events/batch -H 'Content-Type: application/json' \
+  -d '{"device_id":"CNC-01","events":[
+        {"source_id":"PLC-9","version":2,"start":"2026-10-01T11:00:00+08:00","end":"2026-10-01T12:30:00+08:00","reason":"failure"},
+        {"source_id":"MES-1","version":2,"start":"2026-10-01T09:00:00+08:00","end":"2026-10-01T11:30:00+08:00","reason":"maintenance"}]}'
+# 409 {"detail":{"code":"VERSION_CONFLICT","message":"version 2 of source 'MES-1' already exists ..."}}
+
+# 失败后版本链未推进：PLC-9 v2 仍可经单条或后续批次正常上报
+curl -X POST http://localhost:8000/events -H 'Content-Type: application/json' \
+  -d '{"device_id":"CNC-01","source_id":"PLC-9","version":2,
+       "start":"2026-10-01T11:00:00+08:00","end":"2026-10-01T12:30:00+08:00","reason":"failure"}'
+# 201
+
+# 跳号（应为 v3 却发 v4）→ 409 VERSION_GAP；未知设备 → 404 DEVICE_NOT_FOUND；
+# 空列表或任一项缺时区/未对齐整分钟/原因非法 → 422 VALIDATION_ERROR
+```
+
 ## 变更同步（下游报表订阅）
 
 `GET /changes` 把每次**结算**与每次**导致结果变化的更正 / 现场裁定 / 撤销**暴露为按全局
@@ -400,6 +483,11 @@ curl 'http://localhost:8000/changes?cursor=999'    # INVALID_CURSOR（超过当�
   生效顺序；并发不丢失更新。
 - **迟到更正**：新版本落库后，按"旧版本区间 ∪ 新版本区间"找出受影响的已结算班次，用全部
   来源的最新版本与当前生效裁定重算；仅当分钟数变化时追加新修订（避免空修订），差额 = 新 − 旧。
+- **断网补传**：批量接口与单条共用同一套版本链校验与内容哈希；批次内涉及的来源行按
+  `source_id` 固定顺序 `FOR UPDATE` 加锁（与单条上报、其他批次相互串行，版本链连续无缺口），
+  全部项核对通过前不写入任何数据，随后同事务应用全部新版本并一次性重算 —— 受影响班次按
+  "各来源批前最新 ∪ 批后最新"区间并集确定（中间版本区间不参与），每班次至多重算一次；
+  任一项失败即整体回滚，事件、修订、变更都不留痕。
 - **并发与一致性**：班次不重叠由 PostgreSQL 排他约束（`btree_gist` + `tstzrange '[)'`）兜底；
   结算、更正重算与裁定写入对班次行加锁；事件版本链对来源行加锁，全流程单事务提交。
 - **不可变历史**：`shift_results` 只追加不修改，`(shift_id, revision)` 唯一；裁定撤销只改
@@ -426,6 +514,7 @@ tests/
   test_api.py            # API 端到端测试（需 PostgreSQL）
   test_changes.py        # 变更同步（游标分页/回放/并发）端到端测试（需 PostgreSQL）
   test_adjudications.py  # 现场裁定（提交/幂等/冲突/撤销/联动/并发）端到端测试（需 PostgreSQL）
+  test_event_batch.py    # 断网补传（整批核对/全或无/重算/并发）端到端测试（需 PostgreSQL）
 scripts/smoke.sh         # 冒烟脚本
 Dockerfile / docker-compose.yml / requirements.txt
 ```
